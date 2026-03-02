@@ -1,19 +1,3 @@
-"""
-main.py — Core Logic for Intelligent IPv4 Port Scanner
-=======================================================
-Contains:
-  - Constants (service map, risk weights, thresholds, GUI colours)
-  - Pure helper functions (validate_ipv4, detect_service, get_risk_weight,
-    calculate_risk_level, scan_port)
-  - Banner grabbing  (grab_banner, identify_from_banner)
-  - Reachability check (is_host_reachable)
-  - Export helpers (build_export_data, export_json)
-  - PortScannerEngine (threaded scan loop with stop support)
-
-Import this module from gui.py and testcode.py.
-
-DISCLAIMER: Only scan hosts you own or have explicit permission to scan.
-"""
 
 import json
 import re
@@ -25,10 +9,6 @@ from datetime import datetime
 # Constants & Lookup Tables
 # ---------------------------------------------------------------------------
 
-# Maps well-known port numbers to human-readable service names.
-# Extended from 12 to 40+ ports so the tool covers a much wider surface.
-# For ports NOT in this map, detect_service() falls back to the OS-level
-# socket.getservbyport() database which covers hundreds of additional ports.
 SERVICE_MAP: dict[int, str] = {
     # ── Remote access ──────────────────────────────────────────────────
     21:    "FTP",
@@ -81,92 +61,6 @@ SERVICE_MAP: dict[int, str] = {
     6667:  "IRC-Alt",
 }
 
-# ---------------------------------------------------------------------------
-# Risk Weights  (CVE-justified — see inline notes for each rating)
-# ---------------------------------------------------------------------------
-#
-# Weights reflect real-world exploitation history and CVSS base scores.
-# Higher weight = greater risk of system compromise or data breach when
-# that port is found open on a network host.
-#
-#  5 — CRITICAL
-#      Telnet (23):
-#        Transmits ALL data including credentials as plain text.
-#        Zero encryption.  Any network observer captures passwords trivially.
-#        Deprecated by SSH in the early 2000s.  CVSS equivalent: 9.8.
-#
-#  4 — HIGH
-#      RDP (3389):
-#        BlueKeep  CVE-2019-0708  unauthenticated RCE,  CVSS 9.8.
-#        DejaBlue  CVE-2019-1181  wormable RCE,          CVSS 9.8.
-#        Exposed RDP is the #1 ransomware initial-access vector worldwide.
-#
-#      SMB (445):
-#        EternalBlue CVE-2017-0144  CVSS 8.1  — exploited by WannaCry
-#        and NotPetya, causing billions in damages globally.
-#        PrintNightmare CVE-2021-1675  CVSS 8.8  — spooler privilege
-#        escalation still found on unpatched Windows systems.
-#
-#      MySQL (3306) / MSSQL (1433) / Oracle-DB (1521) / PostgreSQL (5432):
-#        Direct database port exposure.  No application-layer firewall
-#        between attacker and data.  Enables brute-force and exfiltration.
-#
-#      Redis (6379):
-#        No authentication by default in older versions.
-#        CVE-2022-0543  CVSS 10.0 — unauthenticated RCE via Lua sandbox
-#        escape.  Arbitrary file writes allow SSH key injection.
-#
-#      MongoDB (27017):
-#        Unauthenticated by default before v3.0.  Hundreds of thousands
-#        of instances were wiped and held for ransom in 2017.
-#
-#      VNC (5900):
-#        Full graphical desktop if compromised.  Often weak/no passwords.
-#        CVE-2019-15681  CVSS 9.8  — memory disclosure leading to RCE.
-#
-#  3 — MEDIUM-HIGH
-#      FTP (21):
-#        Plaintext credentials like Telnet, lower risk because less used
-#        for interactive sessions today.  Anonymous FTP misconfigs common.
-#
-#      TFTP (69):
-#        No authentication.  Anyone can read/write files.  Exploited for
-#        config theft on routers and switches.
-#
-#      SNMP (161):
-#        Default community strings ("public"/"private") allow full device
-#        info disclosure and sometimes write access.
-#        CVE-2017-6736 Cisco IOS  CVSS 9.8.
-#
-#      NetBIOS (137-139):
-#        Exposes Windows hostnames, user lists, and shares without auth.
-#        Foundation for lateral movement and enumeration attacks.
-#
-#  2 — MEDIUM
-#      SSH (22):
-#        Encrypted, but exposed SSH attracts brute-force and credential-
-#        stuffing.  Lower risk than Telnet — credentials protected in transit.
-#
-#      Mail ports (25, 465, 587, 110, 143, 993, 995):
-#        Risk is open relay abuse and credential exposure, not direct RCE.
-#
-#      LDAP/LDAPS (389, 636):
-#        Anonymous bind can expose Active Directory user/group enumeration.
-#
-#      RPC/MSRPC (111, 135):
-#        Used by historical Windows worms (Blaster, Sasser).
-#        Lower risk on modern patched systems.
-#
-#  1 — LOW
-#      HTTP/HTTPS (80, 443, 8080, 8443, 8888):
-#        Expected to be public-facing.  Risk is in the web application,
-#        not the port exposure itself.
-#
-#      DNS (53):  Expected public service.  Risk is DNS amplification for
-#        DDoS — not a direct host compromise risk.
-#
-#      NTP, DHCP, IPP, Syslog, NFS — informational / low direct risk.
-#
 RISK_WEIGHTS: dict[str, int] = {
     # Critical
     "Telnet":           5,
@@ -275,12 +169,7 @@ SERVICE_PROBES: dict[str, bytes] = {
 
 
 def identify_from_banner(banner: str) -> str:
-    """
-    Match *banner* text against BANNER_PATTERNS.
-
-    Returns the matched service name string, or '' if no pattern matches.
-    An empty return means the caller should keep the port-number-derived name.
-    """
+ 
     for pattern, name in BANNER_PATTERNS:
         if pattern.search(banner):
             return name
@@ -289,27 +178,6 @@ def identify_from_banner(banner: str) -> str:
 
 def grab_banner(host: str, port: int, service_hint: str = "",
                 timeout: float = BANNER_TIMEOUT) -> str:
-    """
-    Connect to an already-open *host*:*port* and read its service banner.
-
-    Strategy
-    --------
-    1. Open a TCP connection to host:port.
-    2. If *service_hint* is in SERVICE_PROBES, send the probe bytes
-       (HTTP and some databases wait for the client to speak first).
-    3. Read up to 1 KB of response data.
-    4. Return the first non-empty line, stripped of control characters,
-       truncated to 120 characters.
-
-    Returns '' on any socket error, timeout, or if nothing is received.
-
-    Parameters
-    ----------
-    host         : IPv4 address (port already confirmed open by scan_port).
-    port         : Port to grab the banner from.
-    service_hint : Name from detect_service() — selects the right probe.
-    timeout      : Socket read timeout (default BANNER_TIMEOUT = 2.0 s).
-    """
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.settimeout(timeout)
@@ -338,22 +206,7 @@ def grab_banner(host: str, port: int, service_hint: str = "",
 # ---------------------------------------------------------------------------
 
 def is_host_reachable(host: str, timeout: float = 2.0) -> bool:
-    """
-    Quick check to see if *host* is up before starting a full port scan.
 
-    Probes a handful of ports that are commonly open on live hosts.
-    If any one responds with a successful TCP connection the host is
-    considered reachable and True is returned immediately.
-
-    This is not definitive — a host with none of the probe ports open
-    will return False even if it is alive.  The result is used only to
-    show a warning dialog, never to silently block a scan.
-
-    Parameters
-    ----------
-    host    : IPv4 address (already validated).
-    timeout : Seconds to wait per probe port (default 2.0).
-    """
     PROBE_PORTS = (80, 443, 22, 445, 8080)
     for port in PROBE_PORTS:
         try:
@@ -384,15 +237,6 @@ def validate_ipv4(address: str) -> bool:
 
 
 def detect_service(port: int) -> str:
-    """
-    Return the service name for *port* using a three-layer approach:
-
-    1. SERVICE_MAP  — our curated 40+ port table (clean names, risk weights
-                      are guaranteed to exist in RISK_WEIGHTS).
-    2. socket.getservbyport() — OS services database, covers hundreds more
-                      ports automatically without any code changes.
-    3. 'Unknown Service' — graceful fallback.
-    """
     if port in SERVICE_MAP:
         return SERVICE_MAP[port]
     try:
@@ -402,21 +246,10 @@ def detect_service(port: int) -> str:
 
 
 def get_risk_weight(service: str) -> int:
-    """
-    Return the integer risk weight for *service*.
-    Defaults to 1 for any name not in RISK_WEIGHTS.
-    """
     return RISK_WEIGHTS.get(service, 1)
 
 
 def calculate_risk_level(total_score: int) -> tuple[str, str]:
-    """
-    Map *total_score* to a (label, emoji) risk level pair.
-
-      score ≤ RISK_LOW_MAX     → ('Low',    '🟢')
-      score ≤ RISK_MEDIUM_MAX  → ('Medium', '🟡')
-      score >  RISK_MEDIUM_MAX → ('High',   '🔴')
-    """
     if total_score <= RISK_LOW_MAX:
         return ("Low", "🟢")
     elif total_score <= RISK_MEDIUM_MAX:
@@ -426,12 +259,6 @@ def calculate_risk_level(total_score: int) -> tuple[str, str]:
 
 
 def scan_port(host: str, port: int, timeout: float = SOCKET_TIMEOUT) -> bool:
-    """
-    Attempt a TCP connect to *host*:*port*.
-
-    Returns True if open, False if closed/filtered/unreachable.
-    Socket is always closed after the attempt.
-    """
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.settimeout(timeout)
@@ -451,18 +278,6 @@ def build_export_data(
     results:    list[dict],
     duration_s: float = 0.0,
 ) -> dict:
-    """
-    Build a structured export dictionary from scan *results*.
-
-    Parameters
-    ----------
-    target_ip  : Scanned IPv4 address.
-    start_port : Start of the scanned port range.
-    end_port   : End of the scanned port range.
-    results    : List of dicts with keys 'port', 'status', 'service',
-                 and optionally 'banner'.
-    duration_s : Elapsed scan time in seconds.
-    """
     open_ports  = [r for r in results if r["status"] == "Open"]
     total_score = sum(get_risk_weight(r["service"]) for r in open_ports)
     risk_label, risk_emoji = calculate_risk_level(total_score)
@@ -471,7 +286,7 @@ def build_export_data(
                   default=None)
 
     return {
-        "tool":                 "Intelligent IPv4 Port Scanner",
+        "tool":                 "NetRisk Scanner",
         "timestamp":            datetime.now().isoformat(timespec="seconds"),
         "target_ip":            target_ip,
         "start_port":           start_port,
@@ -511,16 +326,6 @@ def export_json(data: dict, filepath: str) -> None:
 # ---------------------------------------------------------------------------
 
 class PortScannerEngine:
-    """
-    Threaded port-scan loop with banner grabbing and cooperative stop support.
-
-    on_result callback signature changed to:
-        on_result(port: int, is_open: bool, service: str, banner: str)
-
-    All other behaviour (semaphore, stop event, progress callbacks) is
-    identical to the previous version.
-    """
-
     def __init__(
         self,
         host:        str,
@@ -543,17 +348,6 @@ class PortScannerEngine:
         self._stop_event.set()
 
     def run(self) -> None:
-        """
-        Scan all ports in [start_port, end_port] concurrently.
-
-        For each open port:
-          1. detect_service()       — port-number lookup (3 layers)
-          2. grab_banner()          — active banner read
-          3. identify_from_banner() — override service name if banner
-                                      reveals something different
-
-        All results are passed to on_result(); on_complete() fires when done.
-        """
         ports     = list(range(self.start_port, self.end_port + 1))
         total     = len(ports)
         semaphore = threading.Semaphore(MAX_THREADS)
